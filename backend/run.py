@@ -9,7 +9,7 @@ if __name__ == "__main__":
     # Force disable telemetry
     os.environ["OTEL_SDK_DISABLED"] = "true"
     
-    print("--- Starting AI Triage Platform Backend ---")
+    print("--- Starting Riskwise Backend ---")
     print("Database Location:", os.path.join(os.getcwd(), "data/vulnerabilities.db"))
     
     uvicorn.run(

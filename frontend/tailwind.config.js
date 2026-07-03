@@ -6,7 +6,6 @@ export default {
   ],
   theme: {
     extend: {
-      // Re-adding the HSL mappings so the DetailDrawer doesn't turn invisible
       colors: {
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
@@ -28,6 +27,11 @@ export default {
           900: '#4c1d95',
         }
       },
+      boxShadow: {
+        'sm': '0 1px 2px 0 rgba(0, 0, 0, 0.05)',
+        'md': '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+        'lg': '0 10px 15px -3px rgba(0, 0, 0, 0.1)',
+      }
     },
   },
   plugins: [

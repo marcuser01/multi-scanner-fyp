@@ -1,88 +1,175 @@
 import chromadb
 from openai import OpenAI
 from app.core.config import settings
-from app.models.database import Finding, Scan
-from sqlalchemy.orm import Session
+from app.models.database import Scan, CorrelatedIssue, SystemConfig
+from app.core.database import SessionLocal
+from app.core.security import decrypt_secret
+from sqlalchemy.orm import Session, joinedload
 
 class RAGEngine:
     def __init__(self):
-        # Initialize Local ChromaDB
         self.client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
         self.collection = self.client.get_or_create_collection(name="security_kb")
 
-    async def triage_finding(self, finding_id: int, db: Session):
-        # 1. Fetch Finding and Parent Scan for Context
-        finding = db.query(Finding).filter(Finding.id == finding_id).first()
-        if not finding:
-            return "Finding not found in database."
+    async def triage_issue(self, issue_id: int, db: Session = None):
+        # Maintain backwards compatibility while supporting isolated local sessions
+        is_local_session = db is None
+        if is_local_session:
+            db = SessionLocal()
             
-        scan = db.query(Scan).filter(Scan.id == finding.scan_id).first()
-        
-        # 2. Load API Key
         try:
-            with open(settings.LLM_KEY_PATH, "r") as f:
-                api_key = f.read().strip()
-        except FileNotFoundError:
-            return "Error: API Key file not found. Please set it in Settings."
+            issue = db.query(CorrelatedIssue).options(joinedload(CorrelatedIssue.findings)).filter(CorrelatedIssue.id == issue_id).first()
+            if not issue: 
+                return "Issue not found."
+            scan = db.query(Scan).filter(Scan.id == issue.scan_id).first()
 
-        # 3. Targeted Retrieval (CWE)
-        target_id = f"cwe/{finding.cwe}.md"
-        context_docs = ""
-        
-        try:
-            res = self.collection.get(ids=[target_id])
-            if res['documents']:
-                context_docs = res['documents'][0]
-        except:
-            # Fallback to semantic search
-            search = self.collection.query(query_texts=[finding.description], n_results=1)
-            context_docs = search['documents'][0][0] if search['documents'] else "General security principles."
+            conf = db.query(SystemConfig).filter(SystemConfig.key_name == "OPENROUTER_API_KEY").first()
+            if not conf: 
+                return "Error: API Key not configured in System Settings. Please vault your key."
+            api_key = decrypt_secret(conf.encrypted_value)
 
-        # 4. OpenRouter Integration
-        # FIX: Move extra_headers from the constructor to the .create method
-        client = OpenAI(
-            base_url=settings.OPENROUTER_BASE_URL,
-            api_key=api_key,
-        )
-        
-        # Updated Prompt inside rag_srv.py
+            context_docs = ""
+            if issue.cwe:
+                target_id = f"cwe/{issue.cwe.lower()}.md"
+                try:
+                    res = self.collection.get(ids=[target_id])
+                    if res and res.get('documents') and len(res['documents']) > 0:
+                        context_docs = res['documents'][0]
+                except Exception: 
+                    pass
+
+            evidence_list = []
+            for f in issue.findings:
+                ev = f.evidence
+                if 'file' in ev: evidence_list.append(f"File: {ev['file']} at Line {ev.get('line')}")
+                if 'url' in ev: evidence_list.append(f"URL: {ev['url']} (Method: {ev.get('method')})")
+                if 'package' in ev: evidence_list.append(f"Dependency: {ev['package']} (Version {ev.get('installed_version')})")
+            evidence_str = "\n".join(evidence_list)
+
+            # Deep copy variables needed for the prompt
+            scan_desc = scan.task_description if scan else 'General software'
+            issue_title = issue.title
+            issue_severity = issue.primary_severity
+        finally:
+            # Only close if this engine opened it; don't close upstream-managed sessions
+            if is_local_session:
+                db.close()
+
+        client = OpenAI(base_url=settings.LLM_BASE_URL, api_key=api_key)
+
         prompt = f"""
-        [STRICT INSTRUCTIONS]
-        You are a Senior Security Architect. You must analyze the following finding using ONLY the provided CWE STANDARDS and APP CONTEXT. 
-        If information is missing, explicitly state "Information not provided in scan results."
-        DO NOT hallucinate external libraries or features not mentioned in the context.
+        You are a Senior Security Architect. Analyze this correlated issue.
+        App Context: {scan_desc}
+        Vulnerability: {issue_title} (Severity: {issue_severity})
+        Locations Found:\n{evidence_str}
 
-        [STEP 1: INFORMATION & CONTEXT SUMMARY]
-        - Target Application: {scan.task_name if scan else 'Unnamed'}
-        - Application Purpose: {scan.task_description if scan else 'General software'}
-        - Detected Vulnerability: {finding.title}
-        - Security Standard: {finding.cwe.upper() if finding.cwe else 'N/A'} ({finding.vulnerability_class})
-        - Precise Location: File '{finding.file_path}' at Line {finding.line_number}
-        
-        [STEP 2: CWE KNOWLEDGE BASE GROUNDING]
-        {context_docs if context_docs else "No specific CWE markdown found. Use official OWASP/CWE general principles for " + finding.vulnerability_class}
+        [CWE STANDARDS]
+        {context_docs if context_docs else "Use general OWASP security knowledge."}
 
-        [REQUIRED OUTPUT TASKS]
-        1. Contextual Assessment: Based on the "Application Purpose", how severe is this specific finding for this app?
-        2. Business Impact: Explain to a non-technical owner why they should pay to fix this.
-        3. Prioritized Remediation: 3 clear steps for the developer.
-        4. Secure Code Example: Provide a Python/Javascript fix that resolves the '{finding.title}' issue.
-        
-        Answer in structured clean markdown.
+        Provide a structured markdown response:
+        1. Contextual Assessment (Why does this matter for THIS specific app?)
+        2. Business Impact for management.
+        3. Prioritized Remediation Steps.
+        4. Code/Config Fix Example.
         """
 
         try:
             response = client.chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                # FIX: Pass headers here instead of in OpenAI()
-                extra_headers={
-                    "HTTP-Referer": "http://localhost:5173", 
-                    "X-Title": "AI-Vulnerability-Triage"
-                }
+                extra_headers={"HTTP-Referer": "http://localhost", "X-Title": "AI-Triage"}
             )
             return response.choices[0].message.content
         except Exception as e:
-            if "429" in str(e):
-                return "Error: Rate limit reached."
-            return f"AI Service Error: {str(e)}"
+            return f"Error: AI Service failure. Details: {str(e)}"
+
+    async def generate_scan_summary(self, scan_id: str, db: Session = None):
+        is_local_session = db is None
+        if is_local_session:
+            db = SessionLocal()
+            
+        try:
+            scan = db.query(Scan).filter(Scan.id == scan_id).first()
+            if not scan:
+                return "Error: Scan context not found."
+                
+            issues = db.query(CorrelatedIssue).options(joinedload(CorrelatedIssue.findings)).filter(CorrelatedIssue.scan_id == scan_id).all()
+
+            total = len(issues)
+            highs = len([i for i in issues if i.primary_severity in ['HIGH', 'CRITICAL']])
+
+            issue_context_lines = []
+            for i in issues:
+                sources = list(set([f.scanner_type for f in i.findings]))
+                issue_context_lines.append(f"- {i.primary_severity}: {i.title} (Found by: {', '.join(sources)})")
+            top_issues_context = "\n".join(issue_context_lines[:15])
+
+            conf = db.query(SystemConfig).filter(SystemConfig.key_name == "OPENROUTER_API_KEY").first()
+            if not conf:
+                err_config = "Error: API Key not configured in System Settings. Please vault your key."
+                scan.executive_summary = err_config
+                db.commit()
+                return err_config
+                
+            api_key = decrypt_secret(conf.encrypted_value)
+            
+            # Deep Copy metadata for prompt
+            task_name = scan.task_name
+            task_description = scan.task_description
+            scan_level = scan.scan_level
+        finally:
+            if is_local_session:
+                db.close()
+
+        prompt = f"""
+        You are a Virtual CISO for an SME. Write a 3-paragraph executive security report for the recent scan.
+
+        [APP CONTEXT]
+        Name: {task_name}
+        Description: {task_description}
+        Scan Level: {scan_level}
+
+        [SCAN METRICS]
+        Total Vulnerabilities: {total}
+        High/Critical Risks: {highs}
+
+        [ISSUES FOUND]
+        {top_issues_context if total > 0 else "No vulnerabilities were found!"}
+
+        [TASK]
+        Write a short summary answering:
+        1. What is the overall security posture?
+        2. What are the immediate business risks based on the specific vulnerabilities found?
+        3. What should the engineering team prioritize?
+        Format in clean markdown. Keep it professional and accessible for non-technical managers.
+        """
+
+        try:
+            client = OpenAI(base_url=settings.LLM_BASE_URL, api_key=api_key)
+            response = client.chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                extra_headers={"HTTP-Referer": "http://localhost", "X-Title": "AI-Triage"}
+            )
+            summary = response.choices[0].message.content
+            
+            # Save results in a dedicated short-lived write transaction
+            write_db = SessionLocal()
+            try:
+                write_db.query(Scan).filter(Scan.id == scan_id).update({"executive_summary": summary})
+                write_db.commit()
+            finally:
+                write_db.close()
+                
+            return summary
+        except Exception as e:
+            err_msg = f"Error: Failed to fetch summary. Details: {str(e)}"
+            
+            write_db = SessionLocal()
+            try:
+                write_db.query(Scan).filter(Scan.id == scan_id).update({"executive_summary": err_msg})
+                write_db.commit()
+            finally:
+                write_db.close()
+                
+            return err_msg

@@ -1,0 +1,56 @@
+version: '3.8'
+
+# 1. EXPLICIT NETWORK DECLARATION
+networks:
+  riskwise-net:
+    name: riskwise-net
+
+services:
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: riskwise-docker-proxy
+    privileged: true 
+    networks:
+      - riskwise-net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro,z 
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - NETWORKS=1
+      - VOLUMES=1
+      - POST=1
+      - INFO=1
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: riskwise-backend
+    networks:
+      - riskwise-net
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/data:Z
+      - ./backend/uploads:/app/uploads:Z
+    environment:
+      - DOCKER_HOST=tcp://riskwise-docker-proxy:2375
+      - HOST_UPLOADS_DIR=${PWD}/backend/uploads
+      - JWT_SECRET=change-this-in-production-123
+      # 2. PASS THE EXPLICIT NETWORK TO ZAP
+      - DOCKER_NETWORK_NAME=riskwise-net
+    depends_on:
+      - docker-proxy
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: riskwise-frontend
+    networks:
+      - riskwise-net
+    ports:
+      - "5173:443"  # FIX: Map host 5173 to Nginx Secure HTTPS Port
+      - "8080:80"   # Optional: Map HTTP to 8080 so Nginx can auto-redirect it to HTTPS
+    depends_on:
+      - backend
+    restart: unless-stopped

@@ -5,17 +5,24 @@ from pydantic_settings import BaseSettings
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "Al-Assisted Multi-Scanner Vulnerability Assessment Platform"
+    PROJECT_NAME: str = "Riskwise Vulnerability Multi-Scanner Platform"
     DATABASE_URL: str = f"sqlite:///{os.path.join(BASE_DIR, 'data', 'vulnerabilities.db')}"
     UPLOAD_DIR: str = os.path.join(BASE_DIR, "uploads")
     CHROMA_PATH: str = os.path.join(BASE_DIR, "data", "chroma_db")
-    LLM_KEY_PATH: str = os.path.join(BASE_DIR, "data", "llm_key.txt")
     
-    LLM_MODEL: str = "openrouter/free"
-    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # ---------------------------------------------------------
+    # GENERIC LLM CONFIGURATION
+    # FIX: Changed model slug to "openrouter/free" to match 
+    # $0.00 credit keys. This prevents billing/limit 403 errors.
+    # ---------------------------------------------------------
+    LLM_MODEL: str = "openrouter/free" 
+    LLM_BASE_URL: str = "https://openrouter.ai/api/v1"
 
-    class Config:
-        env_file = ".env"
+    # FIX: Pydantic V2 config to ignore leftover/system environment variables
+    model_config = {
+        "env_file": ".env",
+        "extra": "ignore" 
+    }
 
 settings = Settings()
 

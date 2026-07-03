@@ -2,3 +2,18 @@ __pycache__/
 .venv/
 *.db
 uploads/
+# OS / Environments
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+
+# Application Data & Secrets
+backend/data/
+backend/uploads/
+backend/.fernet.key
+.env
+*.db
+*.sqlite3
