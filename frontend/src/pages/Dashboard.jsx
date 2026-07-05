@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useContext } from 'react';
 import axios from 'axios';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
 import ReactMarkdown from 'react-markdown';
 import { NewScanModal } from '../components/NewScanModal';
 import { DetailDrawer } from '../components/DetailDrawer';
+import { AuthContext } from '../App';
 
 const SEV_STYLES = {
   CRITICAL: 'bg-red-100 text-red-800 border-red-300 ring-red-300',
@@ -16,6 +17,7 @@ const CHART_COLORS = { CRITICAL: '#991b1b', HIGH: '#ea580c', MEDIUM: '#eab308', 
 const SEV_WEIGHT = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1, INFO: 0 };
 
 export default function Dashboard() {
+  const { user } = useContext(AuthContext); 
   const [scans, setScans] = useState([]);
   const [activeScan, setActiveScan] = useState(null);
   const [activeTab, setActiveTab] = useState('overview');
@@ -124,6 +126,23 @@ export default function Dashboard() {
         const errMsg = err.response?.data?.detail || "Failed to generate PDF. Check backend logs.";
         alert(`⚠️ PDF Export Failed\n\n${errMsg}`);
       }
+    }
+  };
+
+  const handleDeleteScan = async () => {
+    if (!window.confirm(`⚠️ CRITICAL PURGE ACTION\n\nAre you sure you want to permanently delete scan "${activeScan.task_name}"?\nThis will purge all findings, database records, and physical PDF assets. This action is non-reversible.`)) {
+      return;
+    }
+    try {
+      await axios.delete(`/api/scans/${activeScan.id}`);
+      // Clean up React State cleanly to prevent null render/white-screen crashes
+      setIssues([]);
+      setScanDetails(null);
+      setSelectedIssue(null);
+      setActiveScan(null);
+      fetchScans(); // Refresh historical sidebar list
+    } catch (err) {
+      alert(err.response?.data?.detail || "Scan purge failed.");
     }
   };
 
@@ -283,6 +302,12 @@ export default function Dashboard() {
                 <p className="text-sm font-bold text-red-600 bg-white px-4 py-3 rounded-xl border border-red-200 mt-2 max-w-lg shadow-sm">
                    {activeScan.error_message || "An unknown error occurred during execution. Check system audit logs."}
                 </p>
+                {/* FIX: Render "Purge Scan" button inside the Failure box, visible ONLY to ADMINs */}
+                {user?.role === 'ADMIN' && (
+                  <button onClick={handleDeleteScan} className="mt-6 text-xs bg-red-100 text-red-700 border border-red-200 font-bold px-4 py-2 rounded-lg hover:bg-red-200 transition uppercase tracking-wider">
+                    Purge Failed Scan
+                  </button>
+                )}
               </div>
             ) : (
               <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
@@ -382,6 +407,12 @@ export default function Dashboard() {
                             {scanDetails?.status === 'completed' && (
                               <button onClick={handleDownloadPDF} className="text-xs bg-slate-800 text-white font-bold px-4 py-2 rounded-lg hover:bg-slate-700 transition shadow border border-slate-700 uppercase tracking-wider">
                                 Export PDF
+                              </button>
+                            )}
+                            {/* FIX: Render "Purge Scan" button in the action bar, visible ONLY to ADMINs */}
+                            {user?.role === 'ADMIN' && (
+                              <button onClick={handleDeleteScan} className="text-xs bg-red-100 text-red-700 border border-red-200 font-bold px-4 py-2 rounded-lg hover:bg-red-200 transition uppercase tracking-wider">
+                                Delete Scan
                               </button>
                             )}
                           </div>

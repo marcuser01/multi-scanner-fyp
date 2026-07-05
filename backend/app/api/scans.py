@@ -21,7 +21,7 @@ from app.services.parser_srv import normalize_semgrep_results, normalize_trivy_r
 from app.services.heuristic_srv import run_heuristic_deduplication
 from app.services.rag_srv import RAGEngine
 from app.core.config import settings
-from app.api.dependencies import require_admin_or_analyst, get_current_user
+from app.api.dependencies import require_admin_or_analyst, get_current_user, require_admin
 
 router = APIRouter()
 rag_service = RAGEngine()
@@ -30,7 +30,7 @@ rag_service = RAGEngine()
 
 def verify_and_pin_url(url: str, user_role: str) -> Optional[str]:
     """
-    SSRF Protection with TOCTOU / DNS-Rebinding mitigation.
+    Hardened SSRF Protection with TOCTOU / DNS-Rebinding mitigation.
     Resolves the hostname, sanitizes encodings, validates all IPv4/IPv6 records, 
     and rewrites the URL using the validated IP to pin the destination.
     """
@@ -49,14 +49,11 @@ def verify_and_pin_url(url: str, user_role: str) -> Optional[str]:
             
         # 2. DEFEAT ENCODING OBFUSCATION (unquotes hex/double encodings)
         hostname = unquote(raw_hostname).strip()
-        
-        # Strip square brackets if the user input was already a raw IPv6 literal
         clean_host = hostname.strip("[]")
 
         # 3. RESOLVE ALL IP ADDRESSES (IPv4 & IPv6 / DNS Round-Robin check)
         resolved_ips = []
         try:
-            # getaddrinfo handles hostnames, octal, decimal, hex, and literal IPs
             addr_info = socket.getaddrinfo(clean_host, None)
             for item in addr_info:
                 resolved_ips.append(item[4][0])
@@ -77,16 +74,17 @@ def verify_and_pin_url(url: str, user_role: str) -> Optional[str]:
                     ip_obj = ip_obj.ipv4_mapped
 
                 # DEFEAT CLOUD METADATA EXFILTRATION (IMDSv1 & IMDSv2 / IPv4 & IPv6)
-                # Hard-blocked globally for ALL users, including Admins
-                aws_metadata_ipv4 = ipaddress.ip_address("169.254.169.254")
-                aws_metadata_ipv6 = ipaddress.ip_address("fd00:ec2::254") # Nitro instance metadata
+                # Hard-blocked globally for ALL users (including Admins) via link-local ranges
+                # This explicitly blocks shorthand bypasses like '169.254.169' -> '169.254.0.169'
+                aws_metadata_ipv6 = ipaddress.ip_address("fd00:ec2::254") # Nitro ULA metadata
                 
-                if ip_obj == aws_metadata_ipv4 or ip_obj == aws_metadata_ipv6:
-                    print(f"[SSRF BLOCKED] Hard Block: Cloud metadata access attempt to '{ip}' rejected.")
+                if ip_obj.is_link_local or ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj == aws_metadata_ipv6:
+                    print(f"[SSRF BLOCKED] Hard Block: System-level address '{ip}' rejected for all roles.")
                     return None
 
-                # 5. DYNAMIC SSRF: Enforce private/loopback blocks strictly for standard DEVELOPERS
-                if ip_obj.is_private or ip_obj.is_loopback:
+                # 5. DYNAMIC WORKSPACE SSRF: Restrict private subnets strictly for standard DEVELOPERS
+                # Admins and Analysts legitimately need to scan internal staging IPs (e.g. 192.168.x.x)
+                if ip_obj.is_private:
                     if user_role == "DEVELOPER":
                         print(f"[SSRF BLOCKED] Restricted destination! Hostname '{clean_host}' resolved to internal IP: {ip}")
                         return None
@@ -100,8 +98,6 @@ def verify_and_pin_url(url: str, user_role: str) -> Optional[str]:
         # 6. RECONSTRUCT THE NETLOC (TOCTOU URL PINNING)
         # Select the first validated IP address to lock downstream requests
         pinned_ip = resolved_ips[0]
-        
-        # Format IPv6 literals with brackets so downstream HTTP libraries don't crash
         netloc = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
             
         if parsed.port:
@@ -233,6 +229,50 @@ async def get_scan_status(scan_id: str, db: Session = Depends(get_db), current_u
     if current_user.role != "ADMIN" and scan.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     return {"id": scan.id, "status": scan.status, "total_issues": scan.total_issues}
+
+# FIX: Added DELETE endpoint to purge scan data, records, and filesystem assets
+@router.delete("/{scan_id}")
+async def delete_scan(scan_id: str, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    
+    try:
+        # 1. Purge physical workspace directory on local filesystem
+        scan_dir = os.path.join(settings.UPLOAD_DIR, scan_id)
+        if os.path.exists(scan_dir):
+            shutil.rmtree(scan_dir)
+
+        # Purge other stray CLI output JSONs
+        for filename in os.listdir(settings.UPLOAD_DIR):
+            if filename.startswith(scan_id):
+                file_path = os.path.join(settings.UPLOAD_DIR, filename)
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+
+        # Purge generated PDF/HTML reports
+        reports_dir = os.path.join(settings.UPLOAD_DIR, "reports")
+        if os.path.exists(reports_dir):
+            for report_file in os.listdir(reports_dir):
+                if scan_id in report_file:
+                    os.remove(os.path.join(reports_dir, report_file))
+
+        # 2. Database Cascade Purge (Deletes Scan and cascades to CorrelatedIssues & Findings)
+        db.delete(scan)
+        
+        # 3. Create AuditLog entry of the destructive action
+        db.add(AuditLog(
+            user_id=admin.id,
+            action="DELETED_SCAN",
+            target=scan_id,
+            details=f"Permanently purged scan record and local directory: {scan.task_name}"
+        ))
+        db.commit()
+        return {"status": "success", "message": "Scan and all compiled assets safely purged from system."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Destructive workflow failed: {str(e)}")
+
 
 async def run_multi_scanner_pipeline(scan_id: str, src_path: str, target_url: str, scan_level: str, scanners: dict, dast_mode: str):
     # 1. Closed, short-lived transaction to clear stale entries
