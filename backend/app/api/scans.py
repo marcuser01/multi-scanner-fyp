@@ -8,7 +8,7 @@ import json
 import traceback
 import socket
 import ipaddress
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from typing import Optional
 
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, Depends, HTTPException, Form

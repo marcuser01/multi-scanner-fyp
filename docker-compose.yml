@@ -1,19 +1,19 @@
-version: '3.8'
+# FIXED: Top-level version removed to prevent Docker Compose v2 warnings
 
-# 1. EXPLICIT NETWORK DECLARATION
 networks:
   riskwise-net:
     name: riskwise-net
 
 services:
+  # Hardened Docker Socket Firewall (Proxy)
   docker-proxy:
     image: tecnativa/docker-socket-proxy:latest
     container_name: riskwise-docker-proxy
-    privileged: true 
+    privileged: true # REQUIRED: Allows mounting docker.sock in strict SELinux contexts (like Fedora)
     networks:
       - riskwise-net
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro,z 
+      - /var/run/docker.sock:/var/run/docker.sock:ro,z # Mounts host socket READ-ONLY with SELinux context
     environment:
       - CONTAINERS=1
       - IMAGES=1
@@ -37,7 +37,6 @@ services:
       - DOCKER_HOST=tcp://riskwise-docker-proxy:2375
       - HOST_UPLOADS_DIR=${PWD}/backend/uploads
       - JWT_SECRET=change-this-in-production-123
-      # 2. PASS THE EXPLICIT NETWORK TO ZAP
       - DOCKER_NETWORK_NAME=riskwise-net
     depends_on:
       - docker-proxy
