@@ -91,9 +91,13 @@ export default function Dashboard() {
     try {
       const res = await axios.post(`/api/results/${activeScan.id}/generate-report`);
       setScanDetails(prev => ({ ...prev, executive_summary: res.data.summary }));
-    } catch (err) { alert("Failed to generate report."); }
+    } catch (err) {
+      const errMsg = err.response?.data?.detail || "Failed to generate report.";
+      alert(`⚠️ AI Summary Error\n\n${errMsg}`);
+    }
     setGeneratingReport(false);
   };
+
 
   const handleDownloadPDF = async () => {
     try {
@@ -104,7 +108,24 @@ export default function Dashboard() {
       link.setAttribute('download', `Security_Report_${activeScan.id.slice(0,8)}.pdf`);
       document.body.appendChild(link);
       link.click();
-    } catch (err) { alert("Failed to generate PDF. Check backend logs."); }
+    } catch (err) {
+      // SECURITY FIX: Decodes JSON error payloads wrapped inside binary Blobs
+      if (err.response && err.response.data instanceof Blob) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const errorJson = JSON.parse(reader.result);
+            alert(`⚠️ PDF Export Failed\n\n${errorJson.detail || "Check backend logs."}`);
+          } catch (e) {
+            alert("⚠️ PDF Export Failed\n\nCould not compile security report. Check backend logs.");
+          }
+        };
+        reader.readAsText(err.response.data);
+      } else {
+        const errMsg = err.response?.data?.detail || "Failed to generate PDF. Check backend logs.";
+        alert(`⚠️ PDF Export Failed\n\n${errMsg}`);
+      }
+    }
   };
 
   const handleUpload = async (file, scanLevel, taskName, taskDescription, scanners, targetUrl, dastMode) => {
@@ -128,7 +149,21 @@ export default function Dashboard() {
       setSelectedIssue(null);
       fetchScans();
     } catch (err) {
-      alert("Failed to start scan. Ensure backend is running.");
+      // ROBUST ERROR PARSING
+      let errorMessage = "Failed to start scan. Ensure backend is running.";
+      
+      if (err.response && err.response.data) {
+        const detail = err.response.data.detail;
+        if (typeof detail === 'string') {
+          errorMessage = detail;
+        } else if (Array.isArray(detail)) {
+          // Handle FastAPI validation/formatting errors
+          errorMessage = detail.map(d => `${d.loc.join('.')}: ${d.msg}`).join('\n');
+        } else if (typeof err.response.data.message === 'string') {
+          errorMessage = err.response.data.message;
+        }
+      }
+      alert(`⚠️ Scan Request Rejected\n\n${errorMessage}`);
     }
   };
 
@@ -144,6 +179,8 @@ export default function Dashboard() {
     issues.forEach(i => { if (counts[i.primary_severity] !== undefined) counts[i.primary_severity]++; });
     return Object.keys(counts).filter(k => counts[k] > 0).map(k => ({ name: k, value: counts[k] }));
   };
+
+  const hasActiveScan = scans.some(s => ['running', 'analyzing'].includes(s.status));
 
   const filteredIssues = issues.filter(i => {
     const matchSev = filterSeverity === 'ALL' || i.primary_severity === filterSeverity;
@@ -163,10 +200,20 @@ export default function Dashboard() {
             <h1 className="text-3xl font-black text-slate-800 tracking-tight">Riskwise Security</h1>
             <p className="text-slate-500 font-medium text-sm mt-1">Multi-Scanner Posture & AI Triage Dashboard</p>
           </div>
-          <button onClick={() => setShowModal(true)} className="bg-blue-600 text-white px-6 py-3 rounded-xl font-bold shadow hover:bg-blue-700 transition uppercase text-sm">
-            + New Scan
+          {/* Visual Lock Implementation */}
+          <button 
+            disabled={hasActiveScan}
+            onClick={() => setShowModal(true)} 
+            className={`px-6 py-3 rounded-xl font-bold shadow transition uppercase text-sm select-none ${
+              hasActiveScan 
+                ? 'bg-slate-300 text-slate-500 cursor-not-allowed shadow-none border border-slate-300' 
+                : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-lg'
+            }`}
+          >
+            {hasActiveScan ? '🔒 Scan In Progress' : '+ New Scan'}
           </button>
         </div>
+
 
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           {/* SIDEBAR: History */}

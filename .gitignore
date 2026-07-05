@@ -17,3 +17,6 @@ backend/.fernet.key
 .env
 *.db
 *.sqlite3
+backend/data/chromadb/chroma.sqlite3
+backend/data/chromadb/chroma.sqlite3-wal
+backend/data/chromadb/chroma.sqlite3-shm

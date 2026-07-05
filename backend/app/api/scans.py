@@ -26,40 +26,99 @@ from app.api.dependencies import require_admin_or_analyst, get_current_user
 router = APIRouter()
 rag_service = RAGEngine()
 
-def verify_and_pin_url(url: str) -> Optional[str]:
+# Replace ONLY this function inside backend/app/api/scans.py
+
+def verify_and_pin_url(url: str, user_role: str) -> Optional[str]:
     """
     SSRF Protection with TOCTOU / DNS-Rebinding mitigation.
-    Resolves the hostname immediately, validates the IP, and rewrites
-    the URL using the raw IP address to pin the destination downstream.
+    Resolves the hostname, sanitizes encodings, validates all IPv4/IPv6 records, 
+    and rewrites the URL using the validated IP to pin the destination.
     """
     try:
         parsed = urlparse(url)
-        hostname = parsed.hostname
-        if not hostname:
+        
+        # 1. ENFORCE STRICT PROTOCOL WHITELIST
+        if parsed.scheme not in ["http", "https"]:
+            print(f"[SSRF WARNING] Blocked invalid scheme '{parsed.scheme}': {url}")
             return None
-        
-        # 1. Resolve the hostname immediately (Time of Check)
-        ip = socket.gethostbyname(hostname)
-        ip_obj = ipaddress.ip_address(ip)
-        
-        # 2. Check against private/loopback allocations
-        if ip_obj.is_private or ip_obj.is_loopback:
+            
+        raw_hostname = parsed.hostname
+        if not raw_hostname:
+            print(f"[SSRF WARNING] Blocked URL with missing hostname: {url}")
             return None
+            
+        # 2. DEFEAT ENCODING OBFUSCATION (unquotes hex/double encodings)
+        hostname = unquote(raw_hostname).strip()
         
-        # 3. Reconstruct the netloc using the literal IP to pin it (Time of Use)
-        netloc = ip
+        # Strip square brackets if the user input was already a raw IPv6 literal
+        clean_host = hostname.strip("[]")
+
+        # 3. RESOLVE ALL IP ADDRESSES (IPv4 & IPv6 / DNS Round-Robin check)
+        resolved_ips = []
+        try:
+            # getaddrinfo handles hostnames, octal, decimal, hex, and literal IPs
+            addr_info = socket.getaddrinfo(clean_host, None)
+            for item in addr_info:
+                resolved_ips.append(item[4][0])
+        except socket.gaierror as dns_err:
+            print(f"[SSRF WARNING] DNS resolution failed for hostname '{clean_host}': {dns_err}")
+            return None
+
+        # Deduplicate resolved records
+        resolved_ips = list(set(resolved_ips))
+
+        # 4. VALIDATE EVERY SINGLE RESOLVED IP
+        for ip in resolved_ips:
+            try:
+                ip_obj = ipaddress.ip_address(ip)
+                
+                # DEFEAT IPv4-MAPPED IPv6 BYPASSES (e.g. ::ffff:127.0.0.1)
+                if hasattr(ip_obj, "ipv4_mapped") and ip_obj.ipv4_mapped:
+                    ip_obj = ip_obj.ipv4_mapped
+
+                # DEFEAT CLOUD METADATA EXFILTRATION (IMDSv1 & IMDSv2 / IPv4 & IPv6)
+                # Hard-blocked globally for ALL users, including Admins
+                aws_metadata_ipv4 = ipaddress.ip_address("169.254.169.254")
+                aws_metadata_ipv6 = ipaddress.ip_address("fd00:ec2::254") # Nitro instance metadata
+                
+                if ip_obj == aws_metadata_ipv4 or ip_obj == aws_metadata_ipv6:
+                    print(f"[SSRF BLOCKED] Hard Block: Cloud metadata access attempt to '{ip}' rejected.")
+                    return None
+
+                # 5. DYNAMIC SSRF: Enforce private/loopback blocks strictly for standard DEVELOPERS
+                if ip_obj.is_private or ip_obj.is_loopback:
+                    if user_role == "DEVELOPER":
+                        print(f"[SSRF BLOCKED] Restricted destination! Hostname '{clean_host}' resolved to internal IP: {ip}")
+                        return None
+                    else:
+                        print(f"[SSRF BYPASS] Administrator authorized internal network scan to: {ip}")
+                        
+            except ValueError:
+                print(f"[SSRF WARNING] Invalid IP format resolved: {ip}")
+                return None
+        
+        # 6. RECONSTRUCT THE NETLOC (TOCTOU URL PINNING)
+        # Select the first validated IP address to lock downstream requests
+        pinned_ip = resolved_ips[0]
+        
+        # Format IPv6 literals with brackets so downstream HTTP libraries don't crash
+        netloc = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+            
         if parsed.port:
-            netloc = f"{ip}:{parsed.port}"
+            netloc = f"{netloc}:{parsed.port}"
         if parsed.username:
             auth = parsed.username
             if parsed.password:
                 auth = f"{auth}:{parsed.password}"
             netloc = f"{auth}@{netloc}"
             
-        # Re-assemble URL with the hardcoded IP address
         pinned_parsed = parsed._replace(netloc=netloc)
-        return pinned_parsed.geturl()
-    except Exception:
+        pinned_url = pinned_parsed.geturl()
+        print(f"[SSRF PASS] Target '{url}' successfully pinned to IP: {pinned_url}")
+        return pinned_url
+        
+    except Exception as e:
+        print(f"[SSRF ERROR] Exception during verification of URL '{url}': {str(e)}")
         return None
 
 def process_and_extract_zip(file_obj, zip_path, extract_path):
@@ -98,6 +157,21 @@ async def create_scan(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # SYSTEM-WIDE LOCK CHECK: Protect local hardware from parallel OOM crashes
+    active_scan = db.query(Scan).filter(Scan.status.in_(["running", "analyzing"])).first()
+    if active_scan:
+        # Log the malicious or unauthorized bypass attempt
+        db.add(AuditLog(
+            user_id=current_user.id,
+            action="BLOCKED_SCAN_TRIGGER",
+            target=active_scan.id,
+            details=f"User attempted to trigger parallel scan '{task_name}' while system was busy."
+        ))
+        db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail="System Busy: A security scan is currently active on the platform. Parallel scans are restricted to prevent memory exhaustion."
+        )
     # BUSINESS LOGIC GUARD: Prevent API Bypass Privilege Escalation
     if current_user.role == "DEVELOPER" and dast_mode == "full":
         db.add(AuditLog(user_id=current_user.id, action="UNAUTHORIZED_DAST_ATTEMPT", target=target_url))
@@ -112,9 +186,10 @@ async def create_scan(
         if not target_url.startswith(("http://", "https://")):
             target_url = "http://" + target_url
         
-        pinned_url = await asyncio.to_thread(verify_and_pin_url, target_url)
+        # FIX: Pass current_user.role as the second positional argument to verify_and_pin_url
+        pinned_url = await asyncio.to_thread(verify_and_pin_url, target_url, current_user.role)
         if not pinned_url:
-            raise HTTPException(status_code=400, detail="Invalid URL or internal/private IPs are restricted.")
+            raise HTTPException(status_code=400, detail="SSRF Blocked: Invalid URL or internal/private IPs are restricted.")
         target_url = pinned_url
 
     upload_path = os.path.join(settings.UPLOAD_DIR, scan_id)
