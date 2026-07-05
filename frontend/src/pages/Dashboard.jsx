@@ -33,11 +33,11 @@ export default function Dashboard() {
   const fetchScans = useCallback(async () => {
     try {
       const res = await axios.get('/api/scans');
-      setScans(res.data);
+      setScans(res.data || []);
 
       // Smart Polling Update Logic
       if (activeScan) {
-        const updatedScan = res.data.find(s => s.id === activeScan.id);
+        const updatedScan = (res.data || []).find(s => s && s.id === activeScan.id);
         if (updatedScan && updatedScan.status !== activeScan.status) {
           setActiveScan(updatedScan);
           // If state flipped to analyzing or completed, fetch new data!
@@ -69,7 +69,7 @@ export default function Dashboard() {
       };
 
       setScanDetails(scan);
-      const sortedIssues = res.data.issues.sort((a, b) => (SEV_WEIGHT[b.primary_severity] || 0) - (SEV_WEIGHT[a.primary_severity] || 0));
+      const sortedIssues = (res.data.issues || []).sort((a, b) => (SEV_WEIGHT[b.primary_severity] || 0) - (SEV_WEIGHT[a.primary_severity] || 0));
       setIssues(sortedIssues);
     } catch (err) { console.error(err); }
   };
@@ -78,7 +78,7 @@ export default function Dashboard() {
     setActiveScan(scan);
     setSelectedIssue(null);
     setActiveTab('overview');
-    if (['analyzing', 'completed'].includes(scan.status)) {
+    if (scan && ['analyzing', 'completed'].includes(scan.status)) {
       loadScanData(scan.id);
     } else {
       setScanDetails(null);
@@ -98,14 +98,13 @@ export default function Dashboard() {
     setGeneratingReport(false);
   };
 
-
   const handleDownloadPDF = async () => {
     try {
       const res = await axios.get(`/api/results/${activeScan.id}/report/pdf`, { responseType: 'blob' });
       const url = window.URL.createObjectURL(new Blob([res.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', `Security_Report_${activeScan.id.slice(0,8)}.pdf`);
+      link.setAttribute('download', `Security_Report_${activeScan?.id ? activeScan.id.slice(0,8) : 'Scan'}.pdf`);
       document.body.appendChild(link);
       link.click();
     } catch (err) {
@@ -170,22 +169,25 @@ export default function Dashboard() {
   const updateIssueWorkflow = async (issueId, payload) => {
     try {
       await axios.patch(`/api/results/${issueId}/workflow`, payload);
-      setIssues(prev => prev.map(iss => iss.id === issueId ? { ...iss, ...payload } : iss));
+      setIssues(prev => (prev || []).map(iss => iss.id === issueId ? { ...iss, ...payload } : iss));
     } catch (err) { console.error("Failed to update workflow", err); }
   };
 
   const getChartData = () => {
     const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
-    issues.forEach(i => { if (counts[i.primary_severity] !== undefined) counts[i.primary_severity]++; });
+    (issues || []).forEach(i => { if (i && counts[i.primary_severity] !== undefined) counts[i.primary_severity]++; });
     return Object.keys(counts).filter(k => counts[k] > 0).map(k => ({ name: k, value: counts[k] }));
   };
 
-  const hasActiveScan = scans.some(s => ['running', 'analyzing'].includes(s.status));
+  // --- HARDENED DERIVED STATES (Handles null/undefined arrays securely) ---
 
-  const filteredIssues = issues.filter(i => {
+  const hasActiveScan = (scans || []).some(s => s && ['running', 'analyzing'].includes(s.status));
+
+  const filteredIssues = (issues || []).filter(i => {
+    if (!i) return false;
     const matchSev = filterSeverity === 'ALL' || i.primary_severity === filterSeverity;
-    const matchScanner = filterScanner === 'ALL' || i.findings.some(f => f.scanner_type === filterScanner);
-    const matchSearch = i.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    const matchScanner = filterScanner === 'ALL' || (i.findings || []).some(f => f.scanner_type === filterScanner);
+    const matchSearch = (i.title || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
     (i.cwe && i.cwe.toLowerCase().includes(searchQuery.toLowerCase()));
     return matchSev && matchScanner && matchSearch;
   });
@@ -220,11 +222,14 @@ export default function Dashboard() {
           <div className="col-span-1 space-y-3">
             <h2 className="text-xs font-black text-slate-500 uppercase tracking-widest px-2">History</h2>
             <div className="space-y-3 pb-24">
-              {scans.map(s => (
+              {(scans || []).map(s => {
+                if (!s) return null;
+                return (
                 <div key={s.id} onClick={() => handleSelectScan(s)}
                   className={`p-4 rounded-xl border-2 cursor-pointer transition ${activeScan?.id === s.id ? 'border-blue-500 bg-blue-50 shadow-md' : 'bg-white border-slate-200 hover:border-slate-300'}`}>
                   <div className="flex justify-between items-center mb-2">
-                    <span className="text-xs text-slate-500 font-mono">{s.id.slice(0,8)}</span>
+                    {/* HARDENING: Null-pointer check on ID slice to prevent white-screen crashes */}
+                    <span className="text-xs text-slate-500 font-mono">{s.id ? s.id.slice(0,8) : 'Unknown'}</span>
                     {s.status === 'running' ? (
                       <span className="text-[10px] font-black uppercase text-blue-600 bg-blue-100 px-2 py-0.5 rounded animate-pulse shadow-sm">Running</span>
                     ) : s.status === 'analyzing' ? (
@@ -236,10 +241,10 @@ export default function Dashboard() {
                     )}
                   </div>
                   <h3 className="font-bold text-slate-800 text-sm truncate">{s.task_name || "Unnamed Scan"}</h3>
-                  <p className="text-xs text-slate-500 mt-1">{new Date(s.scanned_at).toLocaleDateString()}</p>
+                  <p className="text-xs text-slate-500 mt-1">{s.scanned_at ? new Date(s.scanned_at).toLocaleDateString() : 'N/A'}</p>
                 </div>
-              ))}
-              {scans.length === 0 && (
+              )})}
+              {(scans || []).length === 0 && (
                 <div className="text-center py-6 text-slate-400 italic text-xs">No scan history found.</div>
               )}
             </div>
@@ -247,7 +252,7 @@ export default function Dashboard() {
 
           {/* MAIN PANELS */}
           <div className="col-span-3 pb-24">
-            {scans.length === 0 ? (
+            {(scans || []).length === 0 ? (
               <div className="h-[60vh] flex flex-col items-center justify-center border-2 border-dashed border-slate-300 rounded-2xl bg-white text-slate-400 p-8 text-center shadow-sm">
                 <span className="text-6xl mb-4">🚀</span>
                 <h2 className="text-2xl font-black text-slate-800 mb-2">Welcome to Riskwise Security!</h2>
@@ -359,7 +364,7 @@ export default function Dashboard() {
                             </div>
                             <div className="bg-red-50 p-4 rounded-xl border border-red-200 flex flex-col justify-center">
                               <span className="text-sm font-bold text-red-600 uppercase">Critical / High</span>
-                              <span className="text-5xl font-black text-red-700">{issues.filter(i => ['CRITICAL','HIGH'].includes(i.primary_severity)).length}</span>
+                              <span className="text-5xl font-black text-red-700">{issues.filter(i => i && ['CRITICAL','HIGH'].includes(i.primary_severity)).length}</span>
                             </div>
                           </div>
                         </div>
@@ -425,13 +430,15 @@ export default function Dashboard() {
                         </select>
                       </div>
 
-                      {filteredIssues.length === 0 && <p className="text-center text-slate-500 py-10 font-bold text-lg bg-slate-50 rounded-xl border border-slate-200">No findings match your filters.</p>}
+                      {(filteredIssues || []).length === 0 && <p className="text-center text-slate-500 py-10 font-bold text-lg bg-slate-50 rounded-xl border border-slate-200">No findings match your filters.</p>}
 
-                      {filteredIssues.map(issue => (
+                      {(filteredIssues || []).map(issue => {
+                        if (!issue) return null;
+                        return (
                         <div key={issue.id} onClick={() => setSelectedIssue(issue)} className="p-5 border border-slate-200 rounded-xl hover:border-blue-500 cursor-pointer hover:shadow-lg transition bg-white flex justify-between items-center group">
                           <div>
                             <div className="flex items-center gap-2 mb-2">
-                              <span className={`text-xs font-black px-2.5 py-0.5 rounded border ${SEV_STYLES[issue.primary_severity]}`}>
+                              <span className={`text-xs font-black px-2.5 py-0.5 rounded border ${SEV_STYLES[issue.primary_severity] || 'bg-slate-100 text-slate-800'}`}>
                                 {issue.primary_severity}
                               </span>
                               <span className="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">{issue.cwe || 'No CWE'}</span>
@@ -439,14 +446,15 @@ export default function Dashboard() {
                             </div>
                             <h4 className="font-black text-slate-900 text-lg group-hover:text-blue-700 transition">{issue.title}</h4>
                             <div className="flex gap-2 mt-3">
-                              {[...new Set(issue.findings?.map(f => f.scanner_type))].map(type => (
+                              {/* HARDENING: Null-pointer check on findings.map and secure Set iterator to prevent white-screen crashes */}
+                              {[...new Set((issue.findings || []).map(f => f ? f.scanner_type : ''))].filter(Boolean).map(type => (
                                 <span key={type} className="text-[10px] font-bold bg-slate-100 border border-slate-200 text-slate-700 px-2 py-1 rounded uppercase tracking-wider">{type}</span>
                               ))}
                             </div>
                           </div>
                           <div className="text-blue-600 opacity-0 group-hover:opacity-100 group-hover:translate-x-1 transition font-black text-sm uppercase tracking-widest bg-blue-50 px-4 py-2 rounded-lg">Inspect →</div>
                         </div>
-                      ))}
+                      )})}
                     </div>
                   )}
 
@@ -458,10 +466,12 @@ export default function Dashboard() {
                         <p className="text-sm text-slate-500 font-medium mt-1">Check off remediated items and assign responsibilities to your team.</p>
                       </div>
 
-                      {issues.length === 0 && <p className="text-slate-500 font-bold italic">No vulnerabilities to manage.</p>}
+                      {(issues || []).length === 0 && <p className="text-slate-500 font-bold italic">No vulnerabilities to manage.</p>}
 
                       <div className="space-y-8 pl-4 border-l-4 border-slate-100">
-                        {issues.map(issue => (
+                        {(issues || []).map(issue => {
+                          if (!issue) return null;
+                          return (
                           <div key={issue.id} className="relative pl-8 border-l-[3px] border-slate-200 pb-4 last:pb-0 last:border-transparent">
                             
                             <div className={`absolute -left-[13px] top-0 w-6 h-6 rounded-full ring-4 ring-white shadow-md flex items-center justify-center ${
@@ -476,7 +486,7 @@ export default function Dashboard() {
                               <div className="flex justify-between items-start">
                                 <div>
                                   <div className="flex items-center gap-3 mb-2">
-                                    <span className={`text-xs font-black px-2.5 py-0.5 rounded uppercase tracking-wider border ${SEV_STYLES[issue.primary_severity]}`}>
+                                    <span className={`text-xs font-black px-2.5 py-0.5 rounded uppercase tracking-wider border ${SEV_STYLES[issue.primary_severity] || 'bg-slate-100 text-slate-800'}`}>
                                       {issue.primary_severity}
                                     </span>
                                     {issue.owasp && <span className="text-xs font-bold text-blue-800 bg-blue-100 px-2.5 py-0.5 rounded border border-blue-200">{issue.owasp}</span>}
@@ -513,10 +523,12 @@ export default function Dashboard() {
                             </div>
 
                             <div className="space-y-4 pl-6 relative">
-                              {issue.findings?.map((f, index) => (
+                              {(issue.findings || []).map((f, index) => {
+                                if (!f) return null;
+                                return (
                                 <div key={f.id} className="relative pl-6">
                                   <div className="absolute left-0 top-1/2 -mt-px w-6 h-px bg-slate-300"></div>
-                                  <div className={`absolute left-0 top-0 w-px bg-slate-300 ${index === issue.findings.length - 1 ? 'h-1/2' : 'h-full'}`}></div>
+                                  <div className={`absolute left-0 top-0 w-px bg-slate-300 ${index === (issue.findings || []).length - 1 ? 'h-1/2' : 'h-full'}`}></div>
                                   
                                   <div className="bg-white border border-slate-200 rounded-lg p-4 text-sm flex items-center gap-4 shadow-sm hover:border-blue-300 transition">
                                     <span className={`text-[10px] font-black uppercase px-2 py-1 rounded tracking-widest ${
@@ -531,11 +543,11 @@ export default function Dashboard() {
                                     </div>
                                   </div>
                                 </div>
-                              ))}
+                              )})}
                             </div>
 
                           </div>
-                        ))}
+                        )})}
                       </div>
                     </div>
                   )}
@@ -550,7 +562,7 @@ export default function Dashboard() {
       {selectedIssue && (
         <div className="w-1/3 bg-white border-l border-slate-300 shadow-2xl z-10 shrink-0 h-screen sticky top-0 overflow-hidden">
           <DetailDrawer finding={selectedIssue} onClose={() => setSelectedIssue(null)} onUpdate={(id, insight) => {
-             setIssues(prev => prev.map(iss => iss.id === id ? { ...iss, ai_insight: insight } : iss));
+             setIssues(prev => (prev || []).map(iss => iss.id === id ? { ...iss, ai_insight: insight } : iss));
           }}/>
         </div>
       )}
