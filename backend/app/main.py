@@ -5,9 +5,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.api import scans, results, settings as api_settings, auth, users, audit
 from app.core.database import init_db, SessionLocal
+from app.models.database import Scan, AuditLog
 
 os.environ["OTEL_SDK_DISABLED"] = "true"
 os.environ["SAM_CLI_TELEMETRY"] = "0"
+
+if ENV == "production":
+    origins = ["https://yourdomain.com"] # Replace with your strict domain
+else:
+    origins = [
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://localhost:5173",
+        "https://127.0.0.1:5173"
+    ]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,7 +61,7 @@ app = FastAPI(title="Riskwise Security Platform", lifespan=lifespan)
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://localhost", "https://127.0.0.1"], 
+    allow_origins=origins, 
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"], 
     allow_headers=["X-Requested-With", "Content-Type", "Authorization"], # Added X-Requested-With
@@ -75,4 +90,4 @@ app.include_router(audit.router, prefix="/api/audit", tags=["audit"])
 
 @app.get("/")
 def health_check():
-    return {"status": "online"}
+    return {"status": "online", "platform": "AI-Vulnerability-Multi-Scanner"}
