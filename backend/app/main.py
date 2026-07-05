@@ -8,7 +8,7 @@ from app.core.database import init_db, SessionLocal
 from app.models.database import Scan, AuditLog
 
 os.environ["OTEL_SDK_DISABLED"] = "true"
-os.environ["SAM_CLI_TELEMETRY"] = "0"
+ENV = os.getenv("APP_ENV", "development")
 
 if ENV == "production":
     origins = ["https://yourdomain.com"] # Replace with your strict domain
